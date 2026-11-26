@@ -42,6 +42,39 @@ BASE_RPC=https://mainnet.base.org bash scripts/anchor.sh
 python3 verifier/verify.py
 ```
 
+## Verifier output contract
+
+Every check ends in exactly one status:
+
+| Status | Meaning |
+|--------|---------|
+| `PASS` | The check ran and the recomputed or observed value matches. |
+| `FAIL` | The check ran and the value does not match (including: the RPC answered and the `Anchored` event is not there). |
+| `INCONCLUSIVE` | The check could not run: the source was unreachable after bounded retries, answered with something that is not a usable JSON-RPC result, `--no-network` was given, or `anchor.json` is absent. It is neither a pass nor a refutation. |
+
+The last lines are a count (`N PASS, M FAIL, K INCONCLUSIVE`) and the exit code:
+
+| Exit | When |
+|------|------|
+| `0` | No `FAIL` and no `INCONCLUSIVE`. Prints `ALL CHECKS PASS`. |
+| `1` | At least one `FAIL`. |
+| `2` | No `FAIL`, at least one `INCONCLUSIVE`. Prints that this is not a pass. |
+
+Network behaviour:
+
+- Transient failures (HTTP 429, 5xx, timeouts, connection errors) are retried up to 3 attempts with doubling backoff. Other HTTP errors are not retried. When all attempts fail the check is `INCONCLUSIVE`.
+- The leg 2 on-chain check uses the RPC in the `BASE_RPC` environment variable when set, otherwise the `rpc` field of `artifacts/anchor.json`. The output line names which one was used. The leg 1 check uses `SEPOLIA_RPC` the same way.
+- Each log returned by the RPC is re-checked in the verifier (registry address, `Anchored` topic, the ref, not removed) instead of trusting the RPC's own filtering. This does not make the RPC trusted: an RPC that forges a matching log would still be believed. Use an RPC you trust, or compare two.
+- `--no-network` makes no network call at all. Every check that needs the network is reported `INCONCLUSIVE`, so an offline run exits 2.
+
+Behaviour changes versus the earlier verifier: an unreachable leg 2 RPC used to end in a Python traceback; an unreachable leg 1 or leg 3 source was `FAIL` (leg 1) or a `[SKIP]` that still printed `ALL CHECKS PASS` (leg 3); both are now `INCONCLUSIVE` with exit 2.
+
+Tests, with a local fake in place of the network:
+
+```bash
+python3 -I tests/test_verify_network.py
+```
+
 ## The anchor
 
 - **Registry:** `0x49fEcA52bC634a9Ab773226D16619deC547794aa` (same CREATE2
