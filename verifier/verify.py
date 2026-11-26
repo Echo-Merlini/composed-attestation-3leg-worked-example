@@ -17,13 +17,68 @@ re-fetches leg 3 live from its source instead of trusting the cached copy.
      same as babyblueviper1's own framing ("verify aparte si hace falta").
 
 Run: python3 verifier/verify.py [--artifacts DIR] [--no-network]
+
+Output contract (README, "Verifier output contract"): every check is PASS, FAIL
+or INCONCLUSIVE (could not query: neither a pass nor a refutation). Exit 0 =
+no FAIL and no INCONCLUSIVE; 1 = at least one FAIL; 2 = no FAIL but at least
+one INCONCLUSIVE. Env: BASE_RPC (leg 2 on-chain; wins over anchor.json),
+SEPOLIA_RPC (leg 1), VERIFY_BACKOFF_S (retry backoff base, default 1).
 """
 import argparse
 import hashlib
 import json
 import os
 import sys
+import time
+import urllib.error
 import urllib.request
+
+RESULTS = {"PASS": 0, "FAIL": 0, "INCONCLUSIVE": 0}
+ATTEMPTS = 3
+BACKOFF_S = float(os.environ.get("VERIFY_BACKOFF_S", "1"))
+UA = "composed-attestation-3leg-verifier/1.0"
+
+
+def emit(status, text):
+    RESULTS[status] += 1
+    print(f"[{status}] {text}")
+
+
+class Unreachable(Exception):
+    """A remote source could not be queried (not: it answered and refuted)."""
+
+
+def _fetch(req):
+    """urlopen with bounded retry on transient failures (429, 5xx, timeout,
+    connection errors). Raises Unreachable when all attempts fail."""
+    last = None
+    for i in range(ATTEMPTS):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            last = e
+            if not (e.code == 429 or 500 <= e.code < 600):
+                break
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            last = e
+        if i < ATTEMPTS - 1:
+            time.sleep(BACKOFF_S * (2 ** i))
+    raise Unreachable(f"{type(last).__name__}: {last}")
+
+
+def _rpc(url, method, params):
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+    req = urllib.request.Request(url, data=body,
+                                 headers={"Content-Type": "application/json", "User-Agent": UA})
+    raw = _fetch(req)
+    try:
+        resp = json.loads(raw)
+    except ValueError as e:
+        raise Unreachable(f"non-JSON RPC response: {e}")
+    if not isinstance(resp, dict) or "result" not in resp:
+        raise Unreachable(f"RPC returned no result: {str(resp)[:120]}")
+    return resp["result"]
 
 
 def jcs(obj):
@@ -79,7 +134,7 @@ assert keccak256(b'').hex()=='c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7b
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--artifacts", default=os.path.join(os.path.dirname(__file__), "..", "artifacts"))
-    ap.add_argument("--no-network", action="store_true", help="skip live re-fetch of leg 3")
+    ap.add_argument("--no-network", action="store_true", help="do not touch the network: every check that needs it is reported INCONCLUSIVE (not run), exit 2")
     args = ap.parse_args()
 
     art = os.path.abspath(args.artifacts)
@@ -91,31 +146,33 @@ def main():
     preimage3 = leg3["preimage"]
     recomputed3 = "sha256:" + sha256_hex(jcs(preimage3))
     check3a = recomputed3 == leg3["decision_ref"]
-    print(f"[{'PASS' if check3a else 'FAIL'}] leg3 decision_ref recompute (cached preimage): {recomputed3}")
+    emit("PASS" if check3a else "FAIL", f"leg3 decision_ref recompute (cached preimage): {recomputed3}")
     ok &= check3a
 
-    if not args.no_network:
+    if args.no_network:
+        emit("INCONCLUSIVE", "leg3 live re-fetch not run (--no-network); cached-preimage check above still stands")
+    else:
         try:
             req = urllib.request.Request(
                 "https://api.babyblueviper.com/ledger/236",
-                headers={"User-Agent": "composed-attestation-3leg-verifier/1.0"},
+                headers={"User-Agent": UA},
             )
-            with urllib.request.urlopen(req, timeout=15) as r:
-                live = json.loads(r.read())
+            live = json.loads(_fetch(req))
             live_verdict = live["record"]["verdict"]
             live_preimage = {k: live_verdict.get(k) for k in live_verdict["decision_ref_preimage_fields"]}
+        except (Unreachable, ValueError, KeyError, TypeError, AttributeError) as e:
+            emit("INCONCLUSIVE", f"leg3 live re-fetch could not be completed ({e}); cached-preimage check above still stands")
+        else:
             live_recomputed = "sha256:" + sha256_hex(jcs(live_preimage))
             check3b = live_recomputed == live_verdict["decision_ref"] == leg3["decision_ref"]
-            print(f"[{'PASS' if check3b else 'FAIL'}] leg3 decision_ref recompute (live fetch)   : {live_recomputed}")
+            emit("PASS" if check3b else "FAIL", f"leg3 decision_ref recompute (live fetch)   : {live_recomputed}")
             ok &= check3b
-        except Exception as e:
-            print(f"[SKIP] leg3 live re-fetch failed ({e}) — cached-preimage check above still stands")
 
     # --- Leg 2 -------------------------------------------------------------
     leg2 = m["leg2_ours"]
     recomputed_action_ref = sha256_hex(jcs(leg2["action_preimage"]))
     check2a = recomputed_action_ref == leg2["action_ref"] == leg2["anchor_ref_bytes32"][2:]
-    print(f"[{'PASS' if check2a else 'FAIL'}] leg2 action_ref recompute            : {recomputed_action_ref}")
+    emit("PASS" if check2a else "FAIL", f"leg2 action_ref recompute            : {recomputed_action_ref}")
     ok &= check2a
 
     dbp = leg2["decision_binding_payload"]
@@ -123,7 +180,7 @@ def main():
         json.dumps(dict(sorted(dbp.items())), separators=(",", ":"), ensure_ascii=False)
     )
     check2b = recomputed_dbr == leg2["decision_binding_ref"]
-    print(f"[{'PASS' if check2b else 'FAIL'}] leg2 decision_binding_ref recompute  : {recomputed_dbr}")
+    emit("PASS" if check2b else "FAIL", f"leg2 decision_binding_ref recompute  : {recomputed_dbr}")
     ok &= check2b
 
     # --- Leg 2 on-chain anchor ------------------------------------------------
@@ -133,35 +190,45 @@ def main():
             anchor = json.load(f)
     except FileNotFoundError:
         anchor = None
-        print("[SKIP] no anchor.json yet — action_ref not anchored on-chain")
+        emit("INCONCLUSIVE", "no anchor.json yet — action_ref not anchored on-chain")
 
-    if anchor and not args.no_network:
+    if anchor and args.no_network:
+        emit("INCONCLUSIVE", "leg2 on-chain Anchored event not run (--no-network)")
+    elif anchor:
         hint = int(anchor["block"])
-        rpc_url = anchor.get("rpc", "https://mainnet.base.org")
-        req = urllib.request.Request(
-            rpc_url,
-            data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []}).encode(),
-            headers={"Content-Type": "application/json", "User-Agent": "composed-attestation-3leg-verifier/1.0"},
-        )
-        with urllib.request.urlopen(req, timeout=15) as r:
-            head = int(json.loads(r.read())["result"], 16)
-        from_block = hex(max(0, hint - 25))
-        to_block = hex(min(hint + 25, head))
+        # BASE_RPC (verifier-side), when set, wins over the artifact's own "rpc"
+        # field. Without it the default still comes from anchor.json, i.e. the
+        # artifact chooses the oracle: a declared residual (see README).
+        env_rpc = os.environ.get("BASE_RPC")
+        rpc_url = env_rpc or anchor.get("rpc", "https://mainnet.base.org")
+        rpc_src = "BASE_RPC env" if env_rpc else "artifact anchor.json"
         ANCHORED_TOPIC0 = "0xfe2289542f7a0110ac112c3a4d712afdcaaf2900a1326f4e6f340b563a0e8734"
-        body = json.dumps({
-            "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
-            "params": [{"address": anchor["registry"], "fromBlock": from_block, "toBlock": to_block,
-                        "topics": [ANCHORED_TOPIC0, ref]}],
-        }).encode()
-        req = urllib.request.Request(rpc_url, data=body, headers={"Content-Type": "application/json", "User-Agent": "composed-attestation-3leg-verifier/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            logs = json.loads(r.read())["result"]
-        check_anchor = bool(logs)
-        print(f"[{'PASS' if check_anchor else 'FAIL'}] leg2 on-chain Anchored event : {anchor['registry']} ({anchor.get('chain','?')})")
-        if logs:
-            print(f"         tx    : {logs[0]['transactionHash']}")
-            print(f"         block : {int(logs[0]['blockNumber'], 16)}")
-        ok &= check_anchor
+        label = f"leg2 on-chain Anchored event : {anchor['registry']} ({anchor.get('chain','?')}) [rpc: {rpc_src}]"
+        try:
+            head = int(_rpc(rpc_url, "eth_blockNumber", []), 16)
+            from_block = hex(max(0, hint - 25))
+            to_block = hex(min(hint + 25, head))
+            logs = _rpc(rpc_url, "eth_getLogs", [{"address": anchor["registry"],
+                        "fromBlock": from_block, "toBlock": to_block,
+                        "topics": [ANCHORED_TOPIC0, ref]}])
+            if not isinstance(logs, list):
+                raise Unreachable(f"eth_getLogs result is not a list: {str(logs)[:80]}")
+        except (Unreachable, ValueError, TypeError) as e:
+            emit("INCONCLUSIVE", f"{label} — could not query the RPC ({e}); not a pass, not a refutation")
+        else:
+            # Do not trust the RPC's filtering: re-check each returned log client-side.
+            good = [l for l in logs if isinstance(l, dict)
+                    and str(l.get("address", "")).lower() == anchor["registry"].lower()
+                    and not l.get("removed")
+                    and len(l.get("topics") or []) >= 2
+                    and str(l["topics"][0]).lower() == ANCHORED_TOPIC0
+                    and str(l["topics"][1]).lower() == ref.lower()]
+            check_anchor = bool(good)
+            emit("PASS" if check_anchor else "FAIL", label)
+            if good:
+                print(f"         tx    : {good[0].get('transactionHash')}")
+                print(f"         block : {int(good[0]['blockNumber'], 16)}")
+            ok &= check_anchor
 
     # --- Leg 1 ---------------------------------------------------------------
     # --- Leg 1 (WYRIWE/TMerlini) — closed by the leg's author per PR #1810 -----
@@ -186,10 +253,10 @@ def main():
         + bytes.fromhex(L1_INPUT_HASH)                                                  # callDataHash
         + _w(5))                                                                        # actionNonce
     c1 = keccak256(L1_CALLDATA).hex() == L1_INPUT_HASH
-    print(f"[{'PASS' if c1 else 'FAIL'}] leg1 raw calldata -> callDataHash (local keccak)")
+    emit("PASS" if c1 else "FAIL", f"leg1 raw calldata -> callDataHash (local keccak)")
     ok &= c1
     c2 = keccak256(l1_preimage).hex() == L1_COMMITMENT
-    print(f"[{'PASS' if c2 else 'FAIL'}] leg1 PolicyAction preimage -> actionCommitment {L1_COMMITMENT[:10]}… (local keccak)")
+    emit("PASS" if c2 else "FAIL", f"leg1 PolicyAction preimage -> actionCommitment {L1_COMMITMENT[:10]}… (local keccak)")
     ok &= c2
     sep_rpc = os.environ.get("SEPOLIA_RPC", "https://ethereum-sepolia-rpc.publicnode.com")
     sel = keccak256(b"verify(bytes32,bytes32,bytes,bytes)")[:4]
@@ -209,32 +276,36 @@ def main():
         head = (bytes.fromhex(L1_INPUT_HASH) + bytes.fromhex(output_hash_hex)
                 + _w(offset_calldata) + _w(offset_context))
         data = "0x" + (sel + head + calldata_tail + context_tail).hex()
-        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_call",
-                           "params": [{"to": L1_CONTRACT, "data": data}, "latest"]}).encode()
-        req = urllib.request.Request(sep_rpc, data=body,
-            headers={"Content-Type": "application/json", "User-Agent": "composed-attestation-3leg-verifier/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            return int(json.loads(r.read())["result"], 16)
-    try:
-        c3 = _l1_call(L1_COMMITMENT) == 1
-        print(f"[{'PASS' if c3 else 'FAIL'}] leg1 live verify() on {L1_CONTRACT} (Sepolia) returns true")
-        ok &= c3
-        tampered = L1_COMMITMENT[:-1] + ("b" if L1_COMMITMENT[-1] != "b" else "c")
-        c4 = _l1_call(tampered) == 0
-        print(f"[{'PASS' if c4 else 'FAIL'}] leg1 tampered outputHash returns false (fail-closed)")
-        ok &= c4
-    except Exception as e:
-        # BUG (found in code review, fixed here): this used to print [SKIP] and fall
-        # through WITHOUT clearing `ok` -- if the RPC failed, the script still printed
-        # "ALL CHECKS PASS", silently skipping exactly the on-chain checks this PR's
-        # own title claims to close. Fail-closed instead: a network failure here is a
-        # failed verification, not a skip.
-        print(f"[FAIL] leg1 live verify() unreachable ({e}) — on-chain checks could not run, not a pass")
-        ok = False
+        return int(_rpc(sep_rpc, "eth_call", [{"to": L1_CONTRACT, "data": data}, "latest"]), 16)
+    if args.no_network:
+        emit("INCONCLUSIVE", "leg1 live verify() + tampered-output negative not run (--no-network)")
+    else:
+        try:
+            r3 = _l1_call(L1_COMMITMENT)
+            tampered = L1_COMMITMENT[:-1] + ("b" if L1_COMMITMENT[-1] != "b" else "c")
+            r4 = _l1_call(tampered)
+        except (Unreachable, ValueError, TypeError) as e:
+            # The RPC could not be queried: neither a pass nor a refutation. Never
+            # a pass (see summary / exit code 2), and never a silent skip.
+            emit("INCONCLUSIVE", f"leg1 live verify() on {L1_CONTRACT} (Sepolia) could not be queried ({e})")
+        else:
+            c3 = r3 == 1
+            emit("PASS" if c3 else "FAIL", f"leg1 live verify() on {L1_CONTRACT} (Sepolia) returns true")
+            ok &= c3
+            c4 = r4 == 0
+            emit("PASS" if c4 else "FAIL", "leg1 tampered outputHash returns false (fail-closed)")
+            ok &= c4
 
     print()
-    print("ALL CHECKS PASS" if ok else "SOME CHECKS FAILED")
-    sys.exit(0 if ok else 1)
+    print(f"{RESULTS['PASS']} PASS, {RESULTS['FAIL']} FAIL, {RESULTS['INCONCLUSIVE']} INCONCLUSIVE")
+    if RESULTS["FAIL"]:
+        print("SOME CHECKS FAILED")
+        sys.exit(1)
+    if RESULTS["INCONCLUSIVE"]:
+        print("INCONCLUSIVE: no check failed, but not every check could run — this is NOT a pass")
+        sys.exit(2)
+    print("ALL CHECKS PASS")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
