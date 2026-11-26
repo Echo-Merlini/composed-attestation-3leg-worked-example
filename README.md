@@ -28,6 +28,8 @@ calldata hash and of the PolicyAction preimage, a live `verify()` call on the
 deployed Sepolia contract, and the same call with a tampered `outputHash`,
 which must return false.
 
+The `verified_by_us: false` field of `leg1_transparent` in `artifacts/manifest.json` is written by `scripts/produce.py`, which captures and recomputes nothing for leg 1. It does not describe the four checks that `verifier/verify.py` runs.
+
 ## What's here
 
 | Path | What it is |
