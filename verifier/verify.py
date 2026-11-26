@@ -17,6 +17,12 @@ re-fetches leg 3 live from its source instead of trusting the cached copy.
      same as babyblueviper1's own framing ("verify aparte si hace falta").
 
 Run: python3 verifier/verify.py [--artifacts DIR] [--no-network]
+
+Output contract (README, "Verifier output contract"): every check is PASS, FAIL
+or INCONCLUSIVE (could not query: neither a pass nor a refutation). Exit 0 =
+no FAIL and no INCONCLUSIVE; 1 = at least one FAIL; 2 = no FAIL but at least
+one INCONCLUSIVE. Env: BASE_RPC (leg 2 on-chain; wins over anchor.json),
+SEPOLIA_RPC (leg 1), VERIFY_BACKOFF_S (retry backoff base, default 1).
 """
 import argparse
 import hashlib

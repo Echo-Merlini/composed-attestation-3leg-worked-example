@@ -11,7 +11,7 @@ covering a different vantage on the same `artifact_hash`
 
 | Leg | What | Produced by | Verified here |
 |-----|------|-------------|----------------|
-| 1 — transparent | WYRIWE, live Sepolia contract `0x3f98686f2D286A95435BA5916ec663219BE387Ad` | TMerlini | No — referenced only, out of scope for this script |
+| 1 — transparent | WYRIWE, live Sepolia contract `0x3f98686f2D286A95435BA5916ec663219BE387Ad` | TMerlini | Four checks only, run by `verifier/verify.py` (see below); not produced by `scripts/produce.py` |
 | 2 — ours | `action_ref` (action-ref-v1) + `decision_binding_ref` (decision-binding-ref-v1.0), same specs/fixtures as every other worked example in argentum-core | us | Yes — recomputed from declared preimage |
 | 3 — attested | `decision_ref` = `sha256:5bca0bf…b9b9`, invinoveritas ledger entry [#236](https://api.babyblueviper.com/ledger/236) | babyblueviper1 | Yes — recomputed from declared preimage, cross-checked against a live re-fetch |
 
@@ -20,17 +20,20 @@ covering a different vantage on the same `artifact_hash`
 Same pattern as CTEF/CONSILIUM: nobody's prose description of what a hash
 covers is taken at face value. Leg 3's `decision_ref` was recomputed
 independently here from the raw verdict object at the source URL — byte-exact
-match confirmed before this repo used it for anything. Leg 1 is explicitly
-**not** verified by this repo (flagged `SKIP` by the verifier) — it wasn't
-produced by us and babyblueviper1's own framing treats it as separately
-checkable.
+match confirmed before this repo used it for anything.
+
+Leg 1 was not produced by us, and this repo makes no claim about its spec as
+a whole. The verifier runs four checks on it: a local keccak recompute of the
+calldata hash and of the PolicyAction preimage, a live `verify()` call on the
+deployed Sepolia contract, and the same call with a tampered `outputHash`,
+which must return false.
 
 ## What's here
 
 | Path | What it is |
 |------|-----------|
 | `scripts/produce.py` | Builds `artifacts/manifest.json`: leg 3 copied verbatim + recomputed, leg 2 derived per our specs against a synthetic demo action bound to the shared `artifact_hash`, leg 1 referenced only. |
-| `verifier/verify.py` | Independent (stdlib-only) verifier. Recomputes leg 3 from the cached preimage AND from a live re-fetch of the ledger entry; recomputes leg 2's `action_ref`/`decision_binding_ref`; explicitly skips leg 1. |
+| `verifier/verify.py` | Independent (stdlib-only) verifier. Recomputes leg 3 from the cached preimage AND from a live re-fetch of the ledger entry; recomputes leg 2's `action_ref`/`decision_binding_ref`; runs four checks on leg 1 (local keccak of its calldata and of its PolicyAction preimage, live `verify()` on the Sepolia contract, and the tampered-`outputHash` negative); a source it cannot reach is reported `INCONCLUSIVE`. |
 | `artifacts/manifest.json` | The canonical instance. |
 
 ## Reproduce
@@ -85,7 +88,7 @@ python3 -I tests/test_verify_network.py
 - Leg 3's `decision_ref` is not separately anchored here — it already lives
   on invinoveritas's own Nostr-backed ledger (entry #236), independently
   checkable there.
-- Leg 1 (WYRIWE) is not touched by this repo at all.
+- Leg 1 (WYRIWE) is not anchored or produced by this repo; the verifier only runs the four checks described above.
 
 ## Scope, explicit
 
